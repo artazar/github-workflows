@@ -1,0 +1,105 @@
+name: "Send Slack notification from Github"
+
+description: "Send Slack notification from Github, use SLACK_WEBHOOK_URL env variable to define Slack target"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Shorten the commit hash
+      if: github.event_name == 'push'
+      id: commit_sha
+      shell: bash
+      run: |
+        if [ "${COMMIT_SHA}" != "" ]
+        then
+          COMMIT_SHA_SHORT=${COMMIT_SHA:0:8}
+        else
+          echo "Error: No commit sha available"
+          exit 1
+        fi
+        echo "Shortened commit sha is ${COMMIT_SHA_SHORT}"
+        echo ::set-output name=commit_sha_short::${COMMIT_SHA_SHORT}  
+      env:
+        COMMIT_SHA: ${{ github.event.head_commit.id }}
+
+    - name: Send build failure alert to Slack
+      if: github.event_name == 'push'
+      id: slack_push
+      uses: slackapi/slack-github-action@v1.18.0
+      with:
+        payload: |
+          {
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "Build for *${{ github.event.repository.name }}* result: *${{ job.status }}*"
+                }
+              },
+              {
+                "type": "divider"
+              },
+              {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "<${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }}|*Github Action Log*>"
+                },
+                "fields": [
+                  {
+                    "type": "mrkdwn",
+                    "text": "Commit <${{ github.event.head_commit.url }}|*${{ steps.commit_sha.outputs.commit_sha_short }}*>"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "Commit author: <${{ github.event.sender.html_url }}|*${{ github.event.sender.login }}*>"
+                  }
+                ]
+              }
+            ]
+          }
+      env:
+        SLACK_WEBHOOK_URL: ${{ env.SLACK_WEBHOOK_URL }}
+        SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+    - name: Send build failure alert to Slack
+      if: github.event_name == 'pull_request'
+      id: slack_pr
+      uses: slackapi/slack-github-action@v1.18.0
+      with:
+        payload: |
+          {
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "PR checks for *${{ github.event.repository.name }}* result: *${{ job.status }}*"
+                }
+              },
+              {
+                "type": "divider"
+              },
+              {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "<${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }}|*Github Action Log*>"
+                },
+                "fields": [
+                  {
+                    "type": "mrkdwn",
+                    "text": "Pull Request <${{ github.event.pull_request.html_url }}|*#${{ github.event.pull_request.number }}*>"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "PR author: <${{ github.event.sender.html_url }}|*${{ github.event.sender.login }}*>"
+                  }
+                ]
+              }
+            ]
+          }
+      env:
+        SLACK_WEBHOOK_URL: ${{ env.SLACK_WEBHOOK_URL }}
+        SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK

@@ -1,0 +1,147 @@
+# This workflow will deploy a container image from Github Packages container registry
+# to a Kubernetes cluster by means of Flux GitOps toolkit
+#
+# Requires the following secrets to be propagated from the calling workflow:
+# - TOKEN_RW -- GitHub Token with RW access to Flux repository
+# - K8S_KUBECONFIG_B64 -- Base64 encoded kubeconfig file to the target cluster
+# - SLACK_WEBHOOK_URL -- (Optional) Slack webhook URL to send notifications
+
+name: Deploy to Kubernetes (Flux)
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: 'Application name to be deployed'
+        required: true
+        type: string
+      app_version:
+        description: 'Application version to be deployed'
+        required: true
+        type: string
+      flux_repo:
+        description: 'Flux repository for cluster management'
+        required: true
+        type: string
+      namespace:
+        description: 'The namespace to deploy to, expected format: <app_group>-<environment>'
+        required: true
+        type: string
+      cluster:
+        description: 'The cluster to deploy to'
+        required: true
+        type: string
+      container_registry:
+        required: false
+        description: "The container registry URL"
+        default: 'ghcr.io'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest 
+
+    timeout-minutes: 30
+
+    steps:
+      - name: Install Flux
+        run: curl -s https://fluxcd.io/install.sh | sudo bash
+
+      - name: Checkout Flux repo
+        uses: actions/checkout@master
+        with:
+          ref: main
+          repository: ${{ github.repository_owner }}/${{ inputs.flux_repo }}
+          token: ${{ secrets.TOKEN_RW }}
+
+      - name: Update application version
+        id: commit_version
+        run: | 
+          yq --version
+
+          # namespace should be named as <APP_GROUP>-<ENV>, e.g myapp-dev
+          export APP_GROUP=$(echo $NAMESPACE | cut -d- -f1)
+          export ENV=$(echo $NAMESPACE | cut -d- -f2)
+          export APP_KS_PATH=kubernetes/clusters/${CLUSTER}/apps/${APP_GROUP}/${ENV}/kustomization.yaml
+
+          echo 'Working with kustomization file:'
+          ls ${APP_KS_PATH}
+
+          # convert IMAGE_REPO to lowercase manually, no native support inside github expressions
+          # ref: https://github.com/github/feedback/discussions/10553
+          export IMAGE_REPO_LOWER=${IMAGE_REPO,,}
+          echo "Image repo is ${IMAGE_REPO_LOWER}"
+          echo "New app version is ${APP_VERSION}"
+          echo 'Before changes:'
+          yq '.images[] | select(.name == env(IMAGE_REPO_LOWER))' ${APP_KS_PATH}
+          yq -i '(.images[] | select(.name == env(IMAGE_REPO_LOWER))).newTag = env(APP_VERSION)' ${APP_KS_PATH}
+          echo 'After changes:'
+          yq '.images[] | select(.name == env(IMAGE_REPO_LOWER))' ${APP_KS_PATH}
+
+          # Make a git commit
+          git config user.name "GitHub Actions Bot"
+          git config user.email "<>"
+          git status
+          git blame ${APP_KS_PATH}
+          git add ${APP_KS_PATH}
+          git commit -m "Update $APP_NAME to version $APP_VERSION at $NAMESPACE namespace"
+          git status
+          git push origin main && SHA=$(git rev-parse HEAD)
+
+          echo ::set-output name=commit_sha::${SHA}
+        env:
+          IMAGE_REPO: ${{ inputs.container_registry }}/${{ github.repository }}
+          APP_VERSION: ${{ inputs.app_version }}
+          APP_NAME: ${{ inputs.app_name }}
+          NAMESPACE: ${{ inputs.namespace }}
+          CLUSTER: ${{ inputs.cluster }}
+
+      - name: Check deployment status in Kubernetes
+        id: deploy_status_check
+        run: |
+          echo ${B64_KUBECONFIG} | base64 -d > ${KUBECONFIG}
+          
+          if kubectl config view
+          then
+            echo 'Successfully connected to the target cluster.'
+          else
+            echo 'Failed to connect to the target cluster.'
+            exit 1
+          fi
+
+          if kubectl get ns ${NAMESPACE} >/dev/null 2>&1
+          then
+            kubectl config set-context --current --namespace=${NAMESPACE}
+            kubectl get pods
+          else
+            echo "Namespace ${NAMESPACE} does not exist!"
+            exit 1
+          fi
+
+          flux reconcile ks ${NAMESPACE} --with-source
+
+          kubectl rollout status deployment ${APP_NAME}
+        env:
+          B64_KUBECONFIG: ${{ secrets.K8S_KUBECONFIG_B64 }}
+          KUBECONFIG: /tmp/kubeconfig
+          NAMESPACE: ${{ inputs.namespace }}
+          APP_NAME: ${{ inputs.app_name }}
+
+      - name: Send Slack notification for build failure
+        if: failure() && env.SLACK_WEBHOOK_URL != ''
+        uses: artazar/github-workflows/.github/actions/slack-notify@main
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Revert the changes if reconciliation fails
+        if: always() && steps.deploy_status_check.outcome != 'success'
+        run: |
+          # Revert the git commit
+          git config user.name "GitHub Actions Bot"
+          git config user.email "<>"
+          git pull origin main
+          git status
+          git revert ${GIT_COMMIT} --no-edit
+          git status
+          git push origin main 
+        env:
+          GIT_COMMIT: ${{ steps.commit_version.outputs.commit_sha }}

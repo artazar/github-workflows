@@ -1,0 +1,242 @@
+# This workflow will build a package using Maven and then publish it to GitHub packages when a release is created
+# For more information see: https://github.com/actions/setup-java/blob/main/docs/advanced-usage.md#apache-maven-with-a-settings-path
+
+name: Build package with Maven and publish as container image to GitHub Packages
+
+on:
+  workflow_call:
+    inputs:
+      node_version:
+        description: 'Version of node.js to run builds on'
+        type: string
+        required: false
+        default: '14'
+      node_package_manager:
+        description: 'Indicate which package manager to use: npm or yarn'
+        type: string
+        required: false
+        default: 'npm'
+      gitversion_image_version:
+        description: 'Version of GitVersion docker image to use'
+        type: string
+        required: false
+        default: '5.10.1-alpine.3.14-6.0'
+      release_branches:
+        description: 'Comma-separated list of branches that generate a tag'
+        type: string
+        required: false
+        default: 'main'
+      project_subdirectory:
+        description: 'The subdirectory relative to repository root where project is located'
+        type: string
+        required: false
+      env_file_path:
+        description: 'Path to env file with a list of variables'
+        type: string
+        required: false
+        default: '.env.example'
+      nginx_image:
+        description: 'Nginx base image to use'
+        type: string
+        required: false
+        default: nginx:1.21-alpine
+    outputs:
+      app_version:
+        description: "The generated version from the build"
+        value: ${{ jobs.build.outputs.app_version }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 30
+
+    permissions:
+      contents: write
+      packages: write
+
+    outputs:
+      app_version: ${{ steps.version.outputs.image_tag }}
+
+    # Set working directory for all steps at once
+    defaults:
+      run:
+        working-directory: ${{ inputs.project_subdirectory || '.' }} 
+
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        ref: ${{ github.head_ref }}   # requirement of GitVersion
+        fetch-depth: 0   # requirement of GitVersion
+
+    ### Versioning
+
+    - name: Generate version
+      if: github.event_name != 'pull_request'
+      id: version
+      working-directory: '.'
+      run: |
+        set -euo pipefail
+
+        echo "Branch is ${GITHUB_REF_NAME}"
+
+        ### This is specific to using GitVersion with GitHub 
+        ### 'develop' and 'main' branches if they exist need to be checked out explicitly prior to GitVersion run
+        git checkout develop || true
+        git checkout main || true
+        git checkout ${GITHUB_REF_NAME}
+
+        docker run --rm -v "$(pwd):/repo" gittools/gitversion:${GITVERSION_IMAGE_VERSION} \
+          /nocache \
+          /nonormalize \
+          /verbosity Verbose \
+          /overrideconfig assembly-versioning-format='{Major}.{Minor}.{Patch}-{PreReleaseLabel}${ShortSha}' \
+          /targetpath /repo | tee /tmp/version 
+
+        VERSION_LONG=$(jq -r '.AssemblySemVer' /tmp/version)
+        VERSION_SHORT=$(jq -r '.MajorMinorPatch' /tmp/version)
+        echo "Long Version is ${VERSION_LONG}"
+        echo "Short Version is ${VERSION_SHORT}"
+        
+        if [ "${GITHUB_REF}" = 'refs/heads/main' ]
+        then
+          echo ::set-output name=image_tag::${VERSION_SHORT}
+          echo "Using ${VERSION_SHORT} version for the built artifacts"
+        else
+          echo ::set-output name=image_tag::${VERSION_LONG}
+          echo "Using ${VERSION_LONG} version for the built artifacts"
+        fi
+      env:
+        GITVERSION_IMAGE_VERSION: ${{ inputs.gitversion_image_version }}
+
+    - name: Add tag to repository
+      id: tag_version
+      uses: mathieudutour/github-tag-action@v6.0
+      with:
+        custom_tag: ${{ steps.version.outputs.image_tag }}
+        release_branches: ${{ inputs.release_branches }}
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+    
+    ### Pre-build actions
+
+    # Enable runtime environment variables
+    - name: Create entrypoint
+      if: github.event_name != 'pull_request'
+      run: |
+        rm -f .env && touch .env
+        echo '#!/usr/bin/env sh' > entrypoint.sh
+
+        # Treat PUBLIC_URL individually
+        echo "PUBLIC_URL='%PUBLIC_URL%'" >> .env
+        echo "sed -i \"s~%PUBLIC_URL%~\$PUBLIC_URL~g\" /usr/share/nginx/html/index.html" >> entrypoint.sh
+
+        # Treat all other env vars defined in .env file
+        for var in $(awk -F= '{print$1}' ${ENV_FILE_PATH})
+        do 
+          echo "${var}='%${var}%'" >> .env
+          echo "find /usr/share/nginx/html -name '*.js' -exec sed -i \"s~%${var}%~\$${var}~g\" {} \;" >> entrypoint.sh
+        done
+
+        echo ".env file content:"
+        cat .env
+        echo "entrypoint file content:"
+        cat entrypoint.sh
+
+      env:
+        ENV_FILE_PATH: ${{ inputs.env_file_path }}  
+
+    # Use generic nginx.conf for all builds
+    - name: Create nginx.conf
+      if: github.event_name != 'pull_request'
+      run: |
+        cat > nginx.conf <<'EOF'
+        server {
+          listen 8080;
+
+          gzip on;
+          gzip_http_version  1.0;
+          gzip_comp_level    5; # 1-9
+          gzip_buffers       16 8k;
+          gzip_min_length    256;
+          gzip_proxied       any;
+          gzip_vary          on;
+
+          # MIME-types
+          gzip_types text/plain application/javascript text/css application/json application/x-javascript text/xml application/xml application/xml+rss text/javascript application/vnd.ms-fontobject application/x-font-ttf font/opentype;
+    
+          location / {
+            root /usr/share/nginx/html;
+            index index.html index.htm;
+            try_files $uri $uri/ /index.html =404;
+          }
+        }
+        EOF
+
+    # Use generic Dockerfile for all builds
+    - name: Create Dockerfile
+      if: github.event_name != 'pull_request'
+      run: |
+        cat > Dockerfile <<EOF
+        FROM ${NGINX_IMAGE}
+        EOF
+        cat >> Dockerfile <<'EOF'
+        RUN addgroup -g 1000 www-group && adduser -S -D -g "" -G www-group -u 1000 www-user && \
+            chown -hR 1000:1000 /usr/share/nginx/html /var/cache/nginx /etc/nginx && \
+            touch /var/run/nginx.pid && chown 1000:1000 /var/run/nginx.pid
+
+        COPY --chown=1000:root build /usr/share/nginx/html
+        COPY nginx.conf /etc/nginx/conf.d/default.conf
+        COPY entrypoint.sh /docker-entrypoint.d/
+        RUN chmod +x /docker-entrypoint.d/entrypoint.sh
+
+        USER 1000
+        EOF
+      env:
+        NGINX_IMAGE: ${{ inputs.nginx_image }}
+
+    ### Build actions
+
+    - name: Set up Node.JS
+      uses: actions/setup-node@v3
+      with:
+        node-version: ${{ inputs.node_version }}
+        cache: ${{ inputs.node_package_manager }}
+
+    - name: Restore dependencies
+      if: inputs.node_package_manager == 'npm'
+      run: npm ci
+
+    - name: Restore dependencies
+      if: inputs.node_package_manager == 'yarn'
+      run: yarn install --immutable --immutable-cache --check-cache
+
+    - name: Build the application
+      if: inputs.node_package_manager == 'npm'
+      run: npm run build
+
+    - name: Build the application
+      if: inputs.node_package_manager == 'yarn'
+      run: yarn build
+
+    - name: Check the built files
+      run: find build/
+
+    ### Publish actions
+
+    - name: Build and push container image
+      if: github.event_name != 'pull_request'
+      uses: artazar/github-workflows/.github/actions/docker-build-and-push@main
+      with:
+        container_tags: ${{ steps.version.outputs.image_tag }}
+        ghcr_user: ${{ secrets.GHCR_USER }}
+        ghcr_token: ${{ secrets.TOKEN_RW }}
+
+    - name: Send Slack notification for build failure
+      if: failure() && env.SLACK_WEBHOOK_URL != ''
+      uses: artazar/github-workflows/.github/actions/slack-notify@main
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

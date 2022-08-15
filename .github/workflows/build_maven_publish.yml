@@ -1,0 +1,246 @@
+# This workflow will build a package using Maven and then publish it to GitHub packages when a release is created
+# For more information see: https://github.com/actions/setup-java/blob/main/docs/advanced-usage.md#apache-maven-with-a-settings-path
+
+name: Build package with Maven and publish as container image to GitHub Packages
+
+on:
+  workflow_call:
+    inputs:
+      java_version:
+        description: 'Version of JDK to run builds on'
+        type: string
+        required: false
+        default: '11'
+      gitversion_image_version:
+        description: 'Version of GitVersion docker image to use'
+        type: string
+        required: false
+        default: '5.10.1-alpine.3.14-6.0'
+      release_branches:
+        description: 'Comma-separated list of branches that generate a tag'
+        type: string
+        required: false
+        default: 'main'
+      project_subdirectory:
+        description: 'The subdirectory relative to repository root where project is located'
+        type: string
+        required: false
+      tomcat_root_context:
+        description: 'Whether to use root context in Tomcat docker image'
+        type: boolean
+        required: false
+        default: true
+      tomcat_image:
+        description: 'Tomcat base image to use'
+        type: string
+        required: false
+        default: 'tomcat:9.0-jre11-openjdk-slim-bullseye'
+    outputs:
+      app_version:
+        description: "The generated version from the build"
+        value: ${{ jobs.build.outputs.app_version }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 30
+
+    permissions:
+      contents: write
+      packages: write
+
+    outputs:
+      app_version: ${{ steps.version.outputs.image_tag }}
+
+    # Set working directory for all steps at once
+    defaults:
+      run:
+        working-directory: ${{ inputs.project_subdirectory || '.' }} 
+
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        ref: ${{ github.head_ref }}   # requirement of GitVersion
+        fetch-depth: 0   # requirement of GitVersion
+
+    ### Versioning
+
+    - name: Generate version
+      if: github.event_name != 'pull_request'
+      id: version
+      working-directory: '.'
+      run: |
+        set -euo pipefail
+
+        echo "Branch is ${GITHUB_REF_NAME}"
+
+        ### This is specific to using GitVersion with GitHub 
+        ### 'develop' and 'main' branches if they exist need to be checked out explicitly prior to GitVersion run
+        git checkout develop || true
+        git checkout main || true
+        git checkout ${GITHUB_REF_NAME}
+
+        docker run --rm -v "$(pwd):/repo" gittools/gitversion:${GITVERSION_IMAGE_VERSION} \
+          /nocache \
+          /nonormalize \
+          /verbosity Verbose \
+          /overrideconfig assembly-versioning-format='{Major}.{Minor}.{Patch}-{PreReleaseLabel}${ShortSha}' \
+          /targetpath /repo | tee /tmp/version 
+
+        VERSION_LONG=$(jq -r '.AssemblySemVer' /tmp/version)
+        VERSION_SHORT=$(jq -r '.MajorMinorPatch' /tmp/version)
+        echo "Long Version is ${VERSION_LONG}"
+        echo "Short Version is ${VERSION_SHORT}"
+        
+        if [ "${GITHUB_REF}" = 'refs/heads/main' ]
+        then
+          echo ::set-output name=image_tag::${VERSION_SHORT}
+        else
+          echo ::set-output name=image_tag::${VERSION_LONG}
+        fi
+      env:
+        GITVERSION_IMAGE_VERSION: ${{ inputs.gitversion_image_version }}
+        
+    - name: Add tag to repository
+      id: tag_version
+      uses: mathieudutour/github-tag-action@v6.0
+      with:
+        custom_tag: ${{ steps.version.outputs.image_tag }}
+        release_branches: ${{ inputs.release_branches }}
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+
+    ### Pre-build actions
+
+    # Use generic tomcat server.xml for all builds
+    - name: Create tomcat server.xml
+      if: github.event_name != 'pull_request'
+      run: |
+        cat > server.xml <<'EOF'
+        <?xml version="1.0" encoding="UTF-8"?>
+        <Server port="8005" shutdown="SHUTDOWN">
+          <Listener className="org.apache.catalina.startup.VersionLoggerListener" />
+          <Listener className="org.apache.catalina.core.AprLifecycleListener" SSLEngine="on" />
+          <Listener className="org.apache.catalina.core.JreMemoryLeakPreventionListener" />
+          <Listener className="org.apache.catalina.mbeans.GlobalResourcesLifecycleListener" />
+          <Listener className="org.apache.catalina.core.ThreadLocalLeakPreventionListener" />
+          <GlobalNamingResources>
+          <Resource name="UserDatabase" auth="Container"
+                      type="org.apache.catalina.UserDatabase"
+                      description="User database that can be updated and saved"
+                      factory="org.apache.catalina.users.MemoryUserDatabaseFactory"
+                      pathname="conf/tomcat-users.xml" />
+          </GlobalNamingResources>
+          <Service name="Catalina">
+              <Connector port="8080"
+                      protocol="org.apache.coyote.http11.Http11NioProtocol"
+                      maxThreads="10000"
+                      maxConnections="1000000"
+                      connectionTimeout="10000"
+                      redirectPort="8443" />
+              <Engine name="Catalina" defaultHost="localhost">
+              <Realm className="org.apache.catalina.realm.LockOutRealm"><Realm className="org.apache.catalina.realm.UserDatabaseRealm"
+                      resourceName="UserDatabase"/>
+              </Realm>
+              <Host name="localhost"  appBase="webapps"
+                    unpackWARs="true" autoDeploy="true"><Valve className="org.apache.catalina.valves.AccessLogValve" directory="logs"
+                      prefix="localhost_access_log" suffix=".txt"
+                      pattern="%h %l %u %t &quot;%r&quot; %s %b" />
+              </Host>
+            </Engine>
+          </Service>
+        </Server>
+        EOF
+
+    # Use generic Dockerfile for all builds
+    - name: Create Dockerfile
+      if: github.event_name != 'pull_request'
+      run: |
+        cat > Dockerfile <<EOF
+        FROM ${TOMCAT_IMAGE}
+        EOF
+
+        cat >> Dockerfile <<'EOF'
+        ARG WAIT_TIMEOUT
+        ARG PORT
+
+        ENV WAIT_TIMEOUT ${WAIT_TIMEOUT:-'60s'}
+        ENV PORT ${PORT:-8080}
+
+        RUN addgroup --gid 1000 www-group && adduser --system --disabled-password --gecos "" --gid 1000 --uid 1000 www-user
+        RUN chown -hR 1000:1000 ${CATALINA_HOME}
+
+        COPY --chown=1000:root server.xml ${CATALINA_HOME}/conf/server.xml
+
+        EXPOSE ${PORT}
+        EOF
+
+        if [ "${TOMCAT_ROOT_CTX}" = true ]; then
+        cat >> Dockerfile <<'EOF'
+
+        COPY --chown=1000:root target/*.war ${CATALINA_HOME}/webapps/ROOT.war
+
+        EOF
+        else
+        cat >> Dockerfile <<'EOF'
+
+        COPY --chown=1000:root target/*.war ${CATALINA_HOME}/webapps/
+
+        EOF
+        fi
+
+        cat >> Dockerfile <<'EOF'
+        USER 1000
+
+        CMD ["catalina.sh", "run"]
+        EOF
+      env:
+        TOMCAT_ROOT_CTX: ${{ inputs.tomcat_root_context }}
+        TOMCAT_IMAGE: ${{ inputs.tomcat_image }}
+
+    - name: Set up JDK 11
+      uses: actions/setup-java@v3
+      with:
+        java-version: ${{ inputs.java_version }}
+        distribution: 'temurin'
+        cache: maven
+
+    - uses: s4u/maven-settings-action@v2.6.0
+      with:
+        servers: |
+          [{
+              "id": "github",
+              "username": "${{ secrets.GH_USER }}",
+              "password": "${{ secrets.TOKEN_RO }}"
+          }]
+
+    ### Build actions
+
+    - name: Package with Maven
+      run: mvn -B clean package
+
+    - name: Check the built files
+      run: |
+        ls -la 
+        ls -la target/
+        find . -type f -name *war*
+
+    ### Publish actions
+
+    - name: Build and push container image
+      if: github.event_name != 'pull_request'
+      uses: artazar/github-workflows/.github/actions/docker-build-and-push@main
+      with:
+        container_tags: ${{ steps.version.outputs.image_tag }}
+        ghcr_user: ${{ secrets.GHCR_USER }}
+        ghcr_token: ${{ secrets.TOKEN_RW }}
+
+    - name: Send Slack notification for build failure
+      if: failure() && env.SLACK_WEBHOOK_URL != ''
+      uses: artazar/github-workflows/.github/actions/slack-notify@main
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

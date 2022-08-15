@@ -1,0 +1,114 @@
+# This workflow will build an iOS application and publish it to App Store
+
+name: Build iOS application and publish to App Store
+
+on:
+  workflow_call:
+    inputs:
+      ruby_version:
+        description: 'Version of Ruby to run builds on'
+        type: string
+        required: false
+        default: '2.7.2'
+      fastlane_lane:
+        description: 'The lane to run within Fastlane action'
+        type: string
+        required: false
+        default: 'build_upload_testflight'
+      project_subdirectory:
+        description: 'The subdirectory relative to repository root where project is located'
+        type: string
+        required: false
+      asc_target_name:
+        description: 'App Store Connect Target name (App name)'
+        type: string
+        required: true
+      asc_team_id:
+        description: 'App Store Connect Team ID'
+        type: string
+        required: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+      packages: write
+
+    # Set working directory for all steps at once
+    defaults:
+      run:
+        working-directory: ${{ inputs.project_subdirectory || '.' }} 
+
+    steps:
+    - uses: actions/checkout@v3
+
+    ### Pre-build actions
+
+    - uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: ${{ inputs.ruby_version }}
+        bundler-cache: true
+        working-directory: ${{ inputs.project_subdirectory || '.' }}
+        
+    - name: Restore dependencies
+      run: |
+        bundle env
+        bundle install
+
+    - uses: actions/cache@v2
+      with:
+        path: Pods
+        key: ${{ runner.os }}-pods-${{ hashFiles('**/Podfile.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-pods-
+
+    - name: Temporary - downgrade cocoapods to overcome 403 cdn errors
+      run: |
+        gem uninstall cocoapods
+        gem install cocoapods -v 1.8
+        pod repo add-cdn trunk https://cdn.cocoapods.org/
+        pod install || true
+        gem install cocoapods
+        pod install
+
+    - name: Import Code-Signing Certificates
+      uses: Apple-Actions/import-codesign-certs@v1
+      with:
+        p12-file-base64: ${{ secrets.IOS_DIST_SIGNING_KEY }}
+        p12-password: ${{ secrets.IOS_DIST_SIGNING_KEY_PASSWORD }}
+
+    ### Build actions
+
+    - uses: maierj/fastlane-action@v2.2.0
+      with:
+        lane: ${{ inputs.fastlane_lane }}
+        subdirectory: ${{ inputs.project_subdirectory }}
+      env:
+        ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+        ASC_TARGET_NAME: ${{ inputs.asc_target_name }}
+        ASC_TEAM_ID: ${{ inputs.asc_team_id }}
+        KEYCHAIN_PATH: ~/Library/Keychains/signing_temp.keychain-db
+
+    #  - name: Build & upload iOS binary
+    #    run: bundle exec fastlane ios build_upload_release
+    #    env:
+    #      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+    #      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+    #      ASC_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+    #      KEYCHAIN_PATH: ~/Library/Keychains/signing_temp.keychain-db
+
+    - name: Send Slack notification for build failure
+      if: failure() && env.SLACK_WEBHOOK_URL != ''
+      uses: artazar/github-workflows/.github/actions/slack-notify@main
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

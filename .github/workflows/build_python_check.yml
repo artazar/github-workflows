@@ -1,0 +1,52 @@
+# This workflow will run maven checks, to be used with PRs
+
+name: Run Python code scans and code style checks
+
+on:
+  workflow_call:
+    inputs:
+      python_version:
+        description: 'Version of Python to run builds on'
+        type: string
+        required: false
+        default: '3.9'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v3
+      with:
+        python-version: ${{ inputs.python_version }}
+
+    - name: Install dependencies
+      run: pip install -r requirements.txt
+
+    - name: Run Linter
+      run: | 
+        for file in $(find . -type f -name "*.py")
+        do
+          echo "Linting $file ..."
+          echo "------------------------------------"
+          pylint $file
+        done
+
+    - name: Send Slack notification for build failure
+      if: failure() && env.SLACK_WEBHOOK_URL != ''
+      uses: artazar/github-workflows/.github/actions/slack-notify@main
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

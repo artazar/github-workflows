@@ -1,0 +1,44 @@
+# This workflow will run maven checks, to be used with PRs
+
+name: Run Kotlin code scans and code style checks
+
+on:
+  workflow_call:
+    inputs:
+      java_version:
+        description: 'Version of JDK to run builds on'
+        type: string
+        required: false
+        default: '11'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+  
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up JDK 11
+      uses: actions/setup-java@v3
+      with:
+        java-version: ${{ inputs.java_version }}
+        distribution: 'temurin'
+      
+    - name: Run code style check with KTLint
+      run: ./gradlew ktlint
+    
+    - name: Send Slack notification for build failure
+      if: failure() && env.SLACK_WEBHOOK_URL != ''
+      uses: artazar/github-workflows/.github/actions/slack-notify@main
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

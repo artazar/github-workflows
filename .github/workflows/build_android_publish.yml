@@ -1,0 +1,222 @@
+# This workflow will build an Android  pplication and publish it to Play Store
+
+name: Build Android application and publish to Play Store
+
+on:
+  workflow_call:
+    inputs:
+      ruby_version:
+        description: 'Version of Ruby to run builds on'
+        type: string
+        required: false
+        default: '2.7.2'
+      fastlane_lane:
+        description: 'The lane to run within Fastlane action'
+        type: string
+        required: false
+        default: 'build_and_deploy'
+      project_subdirectory:
+        description: 'The subdirectory relative to repository root where project is located'
+        type: string
+        required: false
+      bundletool_image:
+        description: 'Repository with supplementary build tools container images'
+        type: string
+        required: true
+      container_registry:
+        description: 'Container registry with supplementary build tools container images'
+        type: string
+        required: false
+        default: 'ghcr.io'
+      send_mail_notification:
+        description: 'Whether to notify about the new build over email'
+        type: boolean
+        required: false
+        default: true
+      mail_recepients_list:
+        description: 'Comma-separated list of email recepients for notifications'
+        type: string
+        required: false
+        default: ''
+      mail_server:
+        description: 'SMTP server address'
+        type: string
+        required: false
+      mail_server_port:
+        description: 'SMTP server port'
+        type: string
+        required: false
+      minio_url:
+        description: 'Target MinIO storage URL for built artifacts'
+        type: string
+        required: true
+      minio_bucket:
+        description: 'Target MinIO bucket'
+        type: string
+        required: false
+        default: 'ci-artifacts-storage'
+      gradle_build_tasks:
+        description: 'Space separated list of Gradle tasks to execute upon build'
+        type: string
+        required: true
+      google_package_name:
+        description: 'Google Play package name (App name)'
+        type: string
+        required: true
+      google_package_track:
+        description: 'Google Play track name'
+        type: string
+        required: true
+      google_package_release_status:
+        description: 'Google Play release status'
+        type: string
+        required: true
+      signing_key_alias:
+        description: 'Signing Key Store key alias'
+        type: string
+        required: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+      packages: write
+
+    # Set working directory for all steps at once
+    defaults:
+      run:
+        working-directory: ${{ inputs.project_subdirectory || '.' }}
+
+    steps:
+    - uses: actions/checkout@v3
+
+    ### Pre-build actions
+
+    - uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: ${{ inputs.ruby_version }}
+        bundler-cache: true
+        working-directory: ${{ inputs.project_subdirectory || '.' }}
+        
+    - name: Restore dependencies
+      run: |
+        bundle env
+        bundle install
+
+    ### Step disabled due to GitHub issue: https://github.com/actions/runner/issues/449
+    #
+    # - name: Cache Gradle dependencies
+    #   uses: actions/cache@v2
+    #   with:
+    #     path: ~/.gradle/caches
+    #     key: ${{ runner.os }}-gradle-caches-${{ hashFiles('**/*.gradle', '**/*.gradle.kts') }}
+
+    - name: Setup Google credentials
+      run: echo ${GOOGLE_CREDENTIALS} | base64 -d > /tmp/google-sa.json
+      env:
+        GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+
+    ### Build actions
+
+    - uses: maierj/fastlane-action@v2.2.0
+      with:
+        lane: ${{ inputs.fastlane_lane }}
+        subdirectory: ${{ inputs.project_subdirectory }}
+      env:
+        GRADLE_BUILD_TASKS: ${{ inputs.gradle_build_tasks }}
+        GOOGLE_PACKAGE_NAME: ${{ inputs.google_package_name }}
+        GOOGLE_PACKAGE_TRACK: ${{ inputs.google_package_track }}
+        GOOGLE_PACKAGE_RELEASE_STATUS: ${{ inputs.google_package_release_status }}
+        SIGNING_KEY_ALIAS: ${{ inputs.signing_key_alias }}
+        SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+        SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+
+    ### Post-build actions
+
+    - name: Log into container registry
+      if: inputs.send_mail_notification == true
+      uses: docker/login-action@28218f9b04b4f3f62068d7b6ce6ca5b26e35336c
+      with:
+        registry: ${{ inputs.container_registry }}
+        username: ${{ secrets.GHCR_USER }}
+        password: ${{ secrets.TOKEN_IMAGE_PULL }}
+
+    - name: Unpack apk
+      id: apk_name
+      if: inputs.send_mail_notification == true
+      run: |
+        ls ./app/build/outputs/bundle/*/*.aab
+        mv ./app/build/outputs/bundle/*/*.aab .
+        APK_NAME=$(ls *.aab|head -1)
+        docker run -v "$(pwd):/app" ${BUNDLETOOL_IMAGE,,} build-apks \
+          --mode=universal \
+          --bundle=/app/${APK_NAME} \
+          --output=/app/app.apks \
+          --ks=/app/${SIGNING_KEYSTORE} \
+          --ks-pass=pass:${SIGNING_STORE_PASSWORD} \
+          --ks-key-alias=${SIGNING_KEY_ALIAS} \
+          --key-pass=pass:${SIGNING_KEY_PASSWORD}
+        mv app.apks app.zip
+        unzip app.zip
+        mv universal.apk ${GOOGLE_PACKAGE_NAME}.${GITHUB_RUN_ID}.apk
+      env:
+        BUNDLETOOL_IMAGE: ${{ inputs.bundletool_image }}
+        GOOGLE_PACKAGE_NAME: ${{ inputs.google_package_name }}
+        SIGNING_KEYSTORE: 'SigningKey'
+        SIGNING_KEY_ALIAS: ${{ inputs.signing_key_alias }}
+        SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+        SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+
+    - name: Upload apk to s3
+      id: minio_upload
+      if: inputs.send_mail_notification == true
+      uses: artazar/github-workflows/.github/actions/minio-action@main
+      with:
+        minio_url: ${{ inputs.minio_url }}
+        minio_bucket: ${{ inputs.minio_bucket }}
+        minio_access_key: ${{ secrets.MINIO_ACCESS_KEY }}
+        minio_secret_key: ${{ secrets.MINIO_SECRET_KEY }}
+        upload_file: true
+        upload_file_path: ${{ inputs.google_package_name }}.${{ github.run_id }}.apk
+        upload_file_s3_path: ${{ github.event.repository.name }}/${{ inputs.google_package_name }}.${{ github.run_id }}.apk
+        generate_shared_url: true
+
+    - name: Send email notification of the new build
+      uses: dawidd6/action-send-mail@v3
+      if: inputs.send_mail_notification == true
+      with:
+        # Required mail server address:
+        server_address: ${{ inputs.mail_server }}
+        # Required mail server port:
+        server_port: ${{ inputs.mail_server_port }}
+        # Optional (recommended): mail server username:
+        username: ${{ secrets.MAIL_USERNAME }}
+        # Optional (recommended) mail server password:
+        password: ${{ secrets.MAIL_PASSWORD }}
+        # Required mail subject:
+        subject: New build for ${{ inputs.google_package_name }} Android app
+        # Required recipients' addresses:
+        to: ${{ inputs.mail_recepients_list }}
+        # Required sender full name (address can be skipped):
+        from: GitHub CI # <user@example.com>
+        # Optional plain body:
+        body: |
+          New version of ${{ inputs.google_package_name }} application is available, check it out! 
+
+          Download link: 
+
+          ${{ steps.minio_upload.outputs.download_url }}
+
+    - name: Send Slack notification for build failure
+      if: failure() && env.SLACK_WEBHOOK_URL != ''
+      uses: artazar/github-workflows/.github/actions/slack-notify@main
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

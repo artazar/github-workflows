@@ -1,0 +1,156 @@
+# This workflow will build a package using Maven and then publish it to GitHub packages when a release is created
+# For more information see: https://github.com/actions/setup-java/blob/main/docs/advanced-usage.md#apache-maven-with-a-settings-path
+
+name: Build package with Maven and publish as container image to GitHub Packages
+
+on:
+  workflow_call:
+    inputs:
+      java_version:
+        description: 'Version of JDK to run builds on'
+        type: string
+        required: false
+        default: '11'
+      version_source:
+        description: 'Obtain version from this origin, supported values: "pom" | "gitversion"'
+        type: string
+        required: false
+        default: 'pom'
+      gitversion_image_version:
+        description: 'Version of GitVersion docker image to use'
+        type: string
+        required: false
+        default: '5.10.1-alpine.3.14-6.0'
+      release_branches:
+        description: 'Comma-separated list of branches that generate a tag'
+        type: string
+        required: false
+        default: 'develop'
+      project_subdirectory:
+        description: 'The subdirectory relative to repository root where project is located'
+        type: string
+        required: false
+    outputs:
+      app_version:
+        description: "The generated version from the build"
+        value: ${{ jobs.build.outputs.app_version }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 30
+
+    permissions:
+      contents: write
+      packages: write
+
+    outputs:
+      app_version: ${{ steps.version.outputs.image_tag }}
+
+    # Set working directory for all steps at once
+    defaults:
+      run:
+        working-directory: ${{ inputs.project_subdirectory || '.' }} 
+
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        ref: ${{ github.head_ref }}   # requirement of GitVersion
+        fetch-depth: 0   # requirement of GitVersion
+
+    ### Versioning
+
+    - name: Get version from pom.xml
+      if: github.event_name != 'pull_request' && inputs.version_source == 'pom'
+      id: version_pom
+      run: | 
+        VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+        echo ::set-output name=version::${VERSION}
+
+    - name: Generate version
+      if: github.event_name != 'pull_request' && inputs.version_source == 'gitversion'
+      id: version_gitversion
+      working-directory: '.'
+      run: |
+        set -euo pipefail
+
+        echo "Branch is ${GITHUB_REF_NAME}"
+
+        ### This is specific to using GitVersion with GitHub 
+        ### 'develop' and 'main' branches if they exist need to be checked out explicitly prior to GitVersion run
+        git checkout develop || true
+        git checkout main || true
+        git checkout ${GITHUB_REF_NAME}
+
+        docker run --rm -v "$(pwd):/repo" gittools/gitversion:${GITVERSION_IMAGE_VERSION} \
+          /nocache \
+          /nonormalize \
+          /verbosity Verbose \
+          /overrideconfig assembly-versioning-format='{Major}.{Minor}.{Patch}-{PreReleaseLabel}${ShortSha}' \
+          /targetpath /repo | tee /tmp/version 
+
+        VERSION_LONG=$(jq -r '.AssemblySemVer' /tmp/version)
+        VERSION_SHORT=$(jq -r '.MajorMinorPatch' /tmp/version)
+        echo "Long Version is ${VERSION_LONG}"
+        echo "Short Version is ${VERSION_SHORT}"
+        
+        if [ "${GITHUB_REF}" = 'refs/heads/main' ]
+        then
+          echo ::set-output name=version::${VERSION_SHORT}
+        else
+          echo ::set-output name=version::${VERSION_LONG}
+        fi
+      env:
+        GITVERSION_IMAGE_VERSION: ${{ inputs.gitversion_image_version }}
+
+    - name: Pick the final version
+      id: version
+      run: |
+        if [ "${VERSION_SOURCE}" = 'gitversion' ]
+        then
+          VERSION=${VERSION_GITVERSION}
+        else 
+          VERSION=${VERSION_POM}
+        fi
+        echo ::set-output name=version::${VERSION}
+        echo "Version: ${VERSION}"
+      env:
+        VERSION_SOURCE: ${{ inputs.version_source }}
+        VERSION_GITVERSION: ${{ steps.version_gitversion.outputs.version }}
+        VERSION_POM: ${{ steps.version_pom.outputs.version }}
+          
+    - name: Add tag to repository
+      id: tag_version
+      uses: mathieudutour/github-tag-action@v6.0
+      with:
+        custom_tag: ${{ steps.version.outputs.version }}
+        release_branches: ${{ inputs.release_branches }}
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+
+    ### Publish actions
+
+    - name: Set up JDK 11
+      uses: actions/setup-java@v3
+      with:
+        java-version: ${{ inputs.java_version }}
+        distribution: 'temurin'
+        cache: maven
+
+    - name: Publish to GitHub Packages
+      run: |
+        mvn versions:set -DnewVersion=${VERSION}
+        mvn --batch-mode deploy
+      env:
+        VERSION: ${{ steps.version.outputs.version }}
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Send Slack notification for build failure
+      if: failure() && env.SLACK_WEBHOOK_URL != ''
+      uses: artazar/github-workflows/.github/actions/slack-notify@main
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

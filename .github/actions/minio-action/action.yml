@@ -1,0 +1,79 @@
+name: "Minio Action"
+
+description: "Manipulate S3 objects on Min.IO storage"
+
+inputs:
+  minio_url:
+    required: true
+    description: "The minio storage URL"
+  minio_bucket:
+    required: true
+    description: "The minio bucket to operate on"
+  minio_access_key:
+    required: true
+    description: "The minio access key ID"
+  minio_secret_key:
+    required: true
+    description: "The minio secret key ID"
+  generate_shared_url:
+    required: false
+    description: "Generate 7-days public URL for a minio object"
+    default: false
+  upload_file:
+    required: false
+    description: "Enable action to upload a file to minio storage"
+    default: false
+  upload_file_path:
+    required: false
+    description: "The source path for the file to be uploaded"
+  upload_file_s3_path:
+    required: false
+    description: "The target path on minio storage for the file to be uploaded"
+  download_file:
+    required: false
+    description: "Enable action to download a file from minio storage"
+    default: false
+  download_file_path:
+    required: false
+    description: "The target path for the file to be downloaded to"
+  download_file_s3_path:
+    required: false
+    description: "The source path on minio storage for the file to be downloaded"
+
+outputs:
+  download_url:
+    description: "Download URL of the shared file"
+    value: ${{ steps.shared_url.outputs.shared_url }}
+
+runs:
+  using: "composite"
+
+  steps:
+    - name: Set up minio configuration
+      shell: bash
+      run: |
+        docker run -v "$(pwd):/tmp" minio/mc --config-dir /tmp alias set github "${S3_URL}" "${S3_ACCESS_KEY}" "${S3_SECRET_KEY}"
+        docker run -v "$(pwd):/tmp" minio/mc --config-dir /tmp alias list github
+      env:
+        S3_URL: ${{ inputs.minio_url }}
+        S3_ACCESS_KEY: ${{ inputs.minio_access_key }}
+        S3_SECRET_KEY: ${{ inputs.minio_secret_key }}
+
+    - name: Upload file to minio
+      if: inputs.upload_file == 'true'   # treat booleans as strings because of bug: https://github.com/actions/runner/issues/1483
+      shell: bash
+      run: docker run -v "$(pwd):/tmp" minio/mc --config-dir /tmp mv /tmp/${{ inputs.upload_file_path }} github/${{ inputs.minio_bucket }}/${{ inputs.upload_file_s3_path }}
+
+    - name: Share a file from minio
+      id: shared_url
+      if: inputs.generate_shared_url == 'true'   # treat booleans as strings because of bug: https://github.com/actions/runner/issues/1483
+      shell: bash
+      run: |
+        SHARED_URL=$(docker run -v "$(pwd):/tmp" minio/mc --config-dir /tmp share download github/${{ inputs.minio_bucket }}/${{ inputs.upload_file_s3_path }} --json | jq '.share')
+        echo "Shared URL is ${SHARED_URL}"
+        echo ::set-output name=shared_url::${SHARED_URL}
+
+    - name: Download file from minio
+      if: inputs.download_file == 'true'   # treat booleans as strings because of bug: https://github.com/actions/runner/issues/1483
+      shell: bash
+      run: docker run -v "$(pwd):/tmp" minio/mc --config-dir /tmp cp github/${{ inputs.minio_bucket }}/${{ inputs.download_file_s3_path }} /tmp/${{ inputs.download_file_path }}
